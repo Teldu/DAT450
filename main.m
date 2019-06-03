@@ -7,8 +7,10 @@
 #define FILENAME_FORMAT @"%0.3f-wave.aif"
 
 int main (int argc, const char * argv[]) {
-    char freqHz[10], lenSec[10], ampdB[10], numHarm[10];
-    char wave[20];
+    char freqHz[10], lenSec[5], ampRatio[5], numHarm[5];
+    char wave[20], fn[40];
+    printf("Enter file name: ");
+    scanf("%s", fn);
     printf ("Choose wave type \n1. Sine\n2. Square\n3. Triangle\n");
     printf ("4. Sawtooth\n5. Pulse\n");
     scanf ("%s", wave);
@@ -16,10 +18,10 @@ int main (int argc, const char * argv[]) {
     scanf ("%s", freqHz);
     printf ("\nEnter duration in seconds: ");
     scanf ("%s", lenSec);
-    printf("\nEnter amplitude: ");
-    scanf ("%s", ampdB);
-    printf("\nEnter number of harmonics: ");
-    scanf("%s", numHarm);
+    printf("\nEnter amplitude ratio: ");
+    scanf ("%s", ampRatio);
+    //printf("\nEnter number of harmonics: ");
+    //scanf("%s", numHarm);
     
    /* if (argc < 2) {
         printf ("Usage: CAToneFileGenerator n\n(where n is tone in Hz)");
@@ -28,13 +30,14 @@ int main (int argc, const char * argv[]) {
     
     double hz = atof(freqHz);    // 2
     double length = atof(lenSec);
-    double amp = atof(ampdB);
-    double harmonics = atof(numHarm);
+    double amp = atof(ampRatio);
+    //double harmonics = atof(numHarm);
     assert (hz > 0);
     length *= SAMPLE_RATE;
     NSLog (@"generating %lf hz tone", hz);
     
-    NSString *fileName = [NSString stringWithFormat:FILENAME_FORMAT, hz];
+    //NSString *fileName = [NSString stringWithFormat:FILENAME_FORMAT, hz];
+    NSString *fileName = [NSString stringWithCString:fn encoding:1];
     NSString *filePath = [[[NSFileManager defaultManager] currentDirectoryPath]
                           stringByAppendingPathComponent: fileName];
     NSURL *fileURL = [NSURL fileURLWithPath: filePath];
@@ -69,26 +72,10 @@ int main (int argc, const char * argv[]) {
     double wavelengthInSamples = SAMPLE_RATE / hz;
     NSLog (@"wavelengthInSamples = %f", wavelengthInSamples);
     
-    while (sampleCount < maxSampleCount) {
-        for (int i=0; i<wavelengthInSamples; i++) {
-            if(wave == "square"){
-                // square wave
-                SInt16 sample;
-                if (i < wavelengthInSamples/2) {
-                    sample = CFSwapInt16HostToBig (SHRT_MAX);
-                } else {
-                    sample = CFSwapInt16HostToBig (SHRT_MIN);
-                }
-                audioErr = AudioFileWriteBytes(audioFile,
-                                               false,
-                                               sampleCount*2,
-                                               &bytesToWrite,
-                                               &sample);
-                assert (audioErr == noErr);
-            }
-            else if(wave == "sawtooth"){
-                // saw wave
-                SInt16 sample = CFSwapInt16HostToBig (((i / wavelengthInSamples) * SHRT_MAX *2) -
+    if(!strcmp("sawtooth", wave)){
+        while (sampleCount < maxSampleCount) {
+            for (int i=0; i<wavelengthInSamples; i++){
+                SInt16 sample = CFSwapInt16HostToBig (amp * ((i / wavelengthInSamples) * SHRT_MAX *2) -
                                                       SHRT_MAX);
                 audioErr = AudioFileWriteBytes(audioFile,
                                                false,
@@ -98,7 +85,29 @@ int main (int argc, const char * argv[]) {
                 assert (audioErr == noErr);
                 sampleCount++;
             }
-            else if(wave == "sine"){
+        }
+    }
+    else if(!strcmp("square", wave)){
+        while (sampleCount < maxSampleCount) {
+            for (int i=0; i<wavelengthInSamples; i++) {
+                    SInt16 sample;
+                    if (i < wavelengthInSamples/2) {
+                        sample = CFSwapInt16HostToBig (SHRT_MAX);
+                    } else {
+                        sample = CFSwapInt16HostToBig (SHRT_MIN);
+                    }
+                    audioErr = AudioFileWriteBytes(audioFile,
+                                                   false,
+                                                   sampleCount*2,
+                                                   &bytesToWrite,
+                                                   &sample);
+                    assert (audioErr == noErr);
+            }
+        }
+    }
+    else if(!strcmp("sine", wave)){
+        while (sampleCount < maxSampleCount) {
+            for (int i=0; i<wavelengthInSamples; i++) {
                 // sine wave
                 SInt16 sample = CFSwapInt16HostToBig ((SInt16) SHRT_MAX *
                                                       sin (2 * M_PI *
@@ -113,7 +122,11 @@ int main (int argc, const char * argv[]) {
                 assert (audioErr == noErr);
                 sampleCount++;
             }
-            else if(wave == "triangle"){
+        }
+    }
+    else if(!strcmp("triangle", wave)){
+        while (sampleCount < maxSampleCount) {
+            for (int i=0; i<wavelengthInSamples; i++) {
                 SInt16 sample = CFSwapInt16HostToBig ((SInt16) SHRT_MAX *
                                                       (0.5 * (sin (2 * M_PI * (i / wavelengthInSamples) * i)) +
                                                        (-1 * (sin (2 * M_PI * (i / wavelengthInSamples) * i * 3) / 9)) +
@@ -129,9 +142,24 @@ int main (int argc, const char * argv[]) {
                 assert (audioErr == noErr);
                 sampleCount++;
             }
-            
-            //else if(/*wave == "pulse"*/argv[2] == "pulse"){
-            //}
+        }
+    }
+    else if(!strcmp("pulse", wave)){
+        while (sampleCount < maxSampleCount) {
+            for (int i=0; i<wavelengthInSamples; i++) {
+                SInt16 sample;
+                if (i < wavelengthInSamples/2) {
+                    sample = CFSwapInt16HostToBig (SHRT_MAX);
+                } else {
+                    sample = CFSwapInt16HostToBig (SHRT_MIN);
+                }
+                audioErr = AudioFileWriteBytes(audioFile,
+                                               false,
+                                               sampleCount*2,
+                                               &bytesToWrite,
+                                               &sample);
+                assert (audioErr == noErr);
+            }
         }
     }
     audioErr = AudioFileClose(audioFile);
