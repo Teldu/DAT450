@@ -4,10 +4,10 @@
 #define SAMPLE_RATE 44100    // 1
 // #define FILENAME_FORMAT @"%0.3f-square.aif"
 // #define FILENAME_FORMAT @"%0.3f-saw.aif"
-#define FILENAME_FORMAT @"%0.3f-wave.aif"
+//#define FILENAME_FORMAT @"%0.3f-wave.aif"
 
 int main (int argc, const char * argv[]) {
-    char freqHz[10], lenSec[5], ampRatio[5], numHarm[5];
+    char freqHz[10], lenSec[5]/*, ampRatio[5], numHarm[5]*/;
     char wave[20], fn[40];
     printf("Enter file name: ");
     scanf("%s", fn);
@@ -18,8 +18,9 @@ int main (int argc, const char * argv[]) {
     scanf ("%s", freqHz);
     printf ("\nEnter duration in seconds: ");
     scanf ("%s", lenSec);
-    printf("\nEnter amplitude ratio: ");
-    scanf ("%s", ampRatio);
+    //printf("\nEnter amplitude ratio: ");
+    //scanf ("%s", ampRatio);
+    printf("\n\n\n");
     //printf("\nEnter number of harmonics: ");
     //scanf("%s", numHarm);
     
@@ -30,10 +31,9 @@ int main (int argc, const char * argv[]) {
     
     double hz = atof(freqHz);    // 2
     double length = atof(lenSec);
-    double amp = atof(ampRatio);
+    //double amp = atof(ampRatio);
     //double harmonics = atof(numHarm);
     assert (hz > 0);
-    length *= SAMPLE_RATE;
     NSLog (@"generating %lf hz tone", hz);
     
     //NSString *fileName = [NSString stringWithFormat:FILENAME_FORMAT, hz];
@@ -72,11 +72,15 @@ int main (int argc, const char * argv[]) {
     double wavelengthInSamples = SAMPLE_RATE / hz;
     NSLog (@"wavelengthInSamples = %f", wavelengthInSamples);
     
-    if(!strcmp("sawtooth", wave)){
+    if(!strcmp("sine", wave)){
         while (sampleCount < maxSampleCount) {
-            for (int i=0; i<wavelengthInSamples; i++){
-                SInt16 sample = CFSwapInt16HostToBig (amp * ((i / wavelengthInSamples) * SHRT_MAX *2) -
-                                                      SHRT_MAX);
+            for (int i=0; i<wavelengthInSamples; i++) {
+                // sine wave
+                SInt16 sample = CFSwapInt16HostToBig ((SInt16) SHRT_MAX *
+                                                      sin (2 * M_PI *
+                                                           (i / wavelengthInSamples)));
+                
+                
                 audioErr = AudioFileWriteBytes(audioFile,
                                                false,
                                                sampleCount*2,
@@ -105,14 +109,15 @@ int main (int argc, const char * argv[]) {
             }
         }
     }
-    else if(!strcmp("sine", wave)){
+    else if(!strcmp("triangle", wave)){
         while (sampleCount < maxSampleCount) {
             for (int i=0; i<wavelengthInSamples; i++) {
-                // sine wave
                 SInt16 sample = CFSwapInt16HostToBig ((SInt16) SHRT_MAX *
-                                                      sin (2 * M_PI *
-                                                           (i / wavelengthInSamples)));
-                
+                                                      (0.5 * (sin (2 * M_PI * (i / wavelengthInSamples) * i)) +
+                                                       (-1 * (sin (2 * M_PI * (i / wavelengthInSamples) * i * 3) / 9)) +
+                                                       (sin (2 * M_PI * (i / wavelengthInSamples) * i * 5) / 25) +
+                                                       (-1 * (sin (2 * M_PI * (i / wavelengthInSamples) * i * 7) / 49))
+                                                       ));
                 
                 audioErr = AudioFileWriteBytes(audioFile,
                                                false,
@@ -124,16 +129,11 @@ int main (int argc, const char * argv[]) {
             }
         }
     }
-    else if(!strcmp("triangle", wave)){
+    else if(!strcmp("sawtooth", wave)){
         while (sampleCount < maxSampleCount) {
-            for (int i=0; i<wavelengthInSamples; i++) {
-                SInt16 sample = CFSwapInt16HostToBig ((SInt16) SHRT_MAX *
-                                                      (0.5 * (sin (2 * M_PI * (i / wavelengthInSamples) * i)) +
-                                                       (-1 * (sin (2 * M_PI * (i / wavelengthInSamples) * i * 3) / 9)) +
-                                                       (sin (2 * M_PI * (i / wavelengthInSamples) * i * 5) / 25) +
-                                                       (-1 * (sin (2 * M_PI * (i / wavelengthInSamples) * i * 7) / 49))
-                                                       ));
-                
+            for (int i=0; i<wavelengthInSamples; i++){
+                SInt16 sample = CFSwapInt16HostToBig (((i / wavelengthInSamples) * SHRT_MAX *2) -
+                                                      SHRT_MAX);
                 audioErr = AudioFileWriteBytes(audioFile,
                                                false,
                                                sampleCount*2,
