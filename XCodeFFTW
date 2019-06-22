@@ -1,0 +1,342 @@
+#include <AudioToolbox/AudioToolbox.h>
+
+#define kPlaybackFileLocation    CFSTR ("./Input.mp3")
+
+void CalculateBytesForTime (AudioFileID inAudioFile, AudioStreamBasicDescription inDesc, Float64 inSeconds, UInt32 *outBufferSize, UInt32 *outNumPackets);
+
+
+#define kNumberPlaybackBuffers    3
+#define kNumberRecordBuffers    3
+typedef struct MyPlayer {
+    // AudioQueueRef                queue; // the audio queue object
+    // AudioStreamBasicDescription dataFormat; // file's data stream description
+    AudioFileID                    playbackFile; // reference to your output file
+    SInt64                        packetPosition; // current packet index in output file
+    UInt32                        numPacketsToRead; // number of packets to read from file
+    AudioStreamPacketDescription *packetDescs; // array of packet descriptions for read buffer
+    // AudioQueueBufferRef            buffers[kNumberPlaybackBuffers];
+    Boolean                        isDone; // playback has completed
+} MyPlayer;
+
+typedef struct MyRecorder {
+    AudioFileID                    recordFile; // reference to your output file
+    SInt64                        recordPacket; // current packet index in output file
+    Boolean                        running; // recording state
+} MyRecorder;
+
+
+#pragma mark - utility functions -
+
+// generic error handler - if err is nonzero, prints error message and exits program.
+static void CheckError(OSStatus error, const char *operation)
+{
+    if (error == noErr) return;
+    
+    char str[20];
+    // see if it appears to be a 4-char-code
+    *(UInt32 *)(str + 1) = CFSwapInt32HostToBig(error);
+    if (isprint(str[1]) && isprint(str[2]) && isprint(str[3]) && isprint(str[4])) {
+        str[0] = str[5] = '\'';
+        str[6] = '\0';
+    } else
+        // no, format it as an integer
+        sprintf(str, "%d", (int)error);
+    
+    fprintf(stderr, "Error: %s (%s)\n", operation, str);
+    
+    exit(1);
+}
+
+// we only use time here as a guideline
+// we're really trying to get somewhere between 16K and 64K buffers, but not allocate too much if we don't need it
+void CalculateBytesForTime (AudioFileID inAudioFile, AudioStreamBasicDescription inDesc, Float64 inSeconds, UInt32 *outBufferSize, UInt32 *outNumPackets)
+{
+    
+    // we need to calculate how many packets we read at a time, and how big a buffer we need.
+    // we base this on the size of the packets in the file and an approximate duration for each buffer.
+    //
+    // first check to see what the max size of a packet is, if it is bigger than our default
+    // allocation size, that needs to become larger
+    UInt32 maxPacketSize;
+    UInt32 propSize = sizeof(maxPacketSize);
+    CheckError(AudioFileGetProperty(inAudioFile, kAudioFilePropertyPacketSizeUpperBound,
+                                    &propSize, &maxPacketSize), "couldn't get file's max packet size");
+    
+    static const int maxBufferSize = 0x10000; // limit size to 64K
+    static const int minBufferSize = 0x4000; // limit size to 16K
+    
+    if (inDesc.mFramesPerPacket) {
+        Float64 numPacketsForTime = inDesc.mSampleRate / inDesc.mFramesPerPacket * inSeconds;
+        *outBufferSize = numPacketsForTime * maxPacketSize;
+    } else {
+        // if frames per packet is zero, then the codec has no predictable packet == time
+        // so we can't tailor this (we don't know how many Packets represent a time period
+        // we'll just return a default buffer size
+        *outBufferSize = maxBufferSize > maxPacketSize ? maxBufferSize : maxPacketSize;
+    }
+    
+    // we're going to limit our size to our default
+    if (*outBufferSize > maxBufferSize && *outBufferSize > maxPacketSize)
+        *outBufferSize = maxBufferSize;
+    else {
+        // also make sure we're not too small - we don't want to go the disk for too small chunks
+        if (*outBufferSize < minBufferSize)
+            *outBufferSize = minBufferSize;
+    }
+    *outNumPackets = *outBufferSize / maxPacketSize;
+}
+
+
+// many encoded formats require a 'magic cookie'. if the file has a cookie we get it
+// and configure the queue with it
+static void MyCopyEncoderCookieToQueue(AudioFileID theFile, AudioQueueRef queue ) {
+    UInt32 propertySize;
+    OSStatus result = AudioFileGetPropertyInfo (theFile, kAudioFilePropertyMagicCookieData, &propertySize, NULL);
+    if (result == noErr && propertySize > 0)
+    {
+        Byte* magicCookie = (UInt8*)malloc(sizeof(UInt8) * propertySize);
+        CheckError(AudioFileGetProperty (theFile, kAudioFilePropertyMagicCookieData, &propertySize, magicCookie), "get cookie from file failed");
+        CheckError(AudioQueueSetProperty(queue, kAudioQueueProperty_MagicCookie, magicCookie, propertySize), "set cookie on queue failed");
+        free(magicCookie);
+    }
+}
+
+static int MyComputeRecordBufferSize(const AudioStreamBasicDescription *format, AudioQueueRef queue, float seconds)
+{
+    int packets, frames, bytes;
+    
+    frames = (int)ceil(seconds * format->mSampleRate);
+    
+    if (format->mBytesPerFrame > 0)                        // 1
+        bytes = frames * format->mBytesPerFrame;
+    else
+    {
+        UInt32 maxPacketSize;
+        if (format->mBytesPerPacket > 0)                // 2
+            maxPacketSize = format->mBytesPerPacket;
+        else
+        {
+            // get the largest single packet size possible
+            UInt32 propertySize = sizeof(maxPacketSize);    // 3
+            CheckError(AudioQueueGetProperty(queue, kAudioConverterPropertyMaximumOutputPacketSize, &maxPacketSize,
+                                             &propertySize), "couldn't get queue's maximum output packet size");
+        }
+        if (format->mFramesPerPacket > 0)
+            packets = frames / format->mFramesPerPacket;     // 4
+        else
+            // worst-case scenario: 1 frame in a packet
+            packets = frames;                            // 5
+        
+        if (packets == 0)        // sanity check
+            packets = 1;
+        bytes = packets * maxPacketSize;                // 6
+    }
+    return bytes;
+}
+// Copy a queue's encoder's magic cookie to an audio file.
+static void MyCopyEncoderCookieToFile(AudioQueueRef queue, AudioFileID theFile)
+{
+    UInt32 propertySize;
+    
+    // get the magic cookie, if any, from the queue's converter
+    OSStatus result = AudioQueueGetPropertySize(queue,
+                                                kAudioConverterCompressionMagicCookie, &propertySize);
+    
+    if (result == noErr && propertySize > 0)
+    {
+        // there is valid cookie data to be fetched;  get it
+        Byte *magicCookie = (Byte *)malloc(propertySize);
+        CheckError(AudioQueueGetProperty(queue, kAudioQueueProperty_MagicCookie, magicCookie,
+                                         &propertySize), "get audio queue's magic cookie");
+        
+        // now set the magic cookie on the output file
+        CheckError(AudioFileSetProperty(theFile, kAudioFilePropertyMagicCookieData, propertySize, magicCookie),
+                   "set audio file's magic cookie");
+        free(magicCookie);
+    }
+}
+
+#pragma mark - audio queue -
+
+static void MyAQOutputCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inCompleteAQBuffer)
+{
+    MyPlayer *aqp = (MyPlayer*)inUserData;
+    if (aqp->isDone) return;
+    
+    // read audio data from file into supplied buffer
+    UInt32 numBytes;
+    UInt32 nPackets = aqp->numPacketsToRead;
+    CheckError(AudioFileReadPackets(aqp->playbackFile,
+                                    false,
+                                    &numBytes,
+                                    aqp->packetDescs,
+                                    aqp->packetPosition,
+                                    &nPackets,
+                                    inCompleteAQBuffer->mAudioData),
+               "AudioFileReadPackets failed");
+    
+    // enqueue buffer into the Audio Queue
+    // if nPackets == 0 it means we are EOF (all data has been read from file)
+    if (nPackets > 0)
+    {
+        inCompleteAQBuffer->mAudioDataByteSize = numBytes;
+        AudioQueueEnqueueBuffer(inAQ,
+                                inCompleteAQBuffer,
+                                (aqp->packetDescs ? nPackets : 0),
+                                aqp->packetDescs);
+        aqp->packetPosition += nPackets;
+    }
+    else
+    {
+        CheckError(AudioQueueStop(inAQ, false), "AudioQueueStop failed");
+        aqp->isDone = true;
+    }
+}
+// Audio Queue callback function, called when an input buffer has been filled.
+static void MyAQInputCallback(void *inUserData, AudioQueueRef inQueue,
+                              AudioQueueBufferRef inBuffer,
+                              const AudioTimeStamp *inStartTime,
+                              UInt32 inNumPackets,
+                              const AudioStreamPacketDescription *inPacketDesc)
+{
+    MyRecorder *recorder = (MyRecorder *)inUserData;
+    
+    // if inNumPackets is greater then zero, our buffer contains audio data
+    // in the format we specified (AAC)
+    if (inNumPackets > 0)
+    {
+        // write packets to file
+        CheckError(AudioFileWritePackets(recorder->recordFile, FALSE, inBuffer->mAudioDataByteSize,
+                                         inPacketDesc, recorder->recordPacket, &inNumPackets,
+                                         inBuffer->mAudioData), "AudioFileWritePackets failed");
+        // increment packet index
+        recorder->recordPacket += inNumPackets;
+    }
+    
+    // if we're not stopping, re-enqueue the buffer so that it gets filled again
+    if (recorder->running)
+        CheckError(AudioQueueEnqueueBuffer(inQueue, inBuffer,
+                                           0, NULL), "AudioQueueEnqueueBuffer failed");
+}
+
+int    main(int argc, const char *argv[])
+{
+    MyPlayer player = {0};
+    MyRecorder recorder = {0};
+    
+    CFURLRef myFileURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, kPlaybackFileLocation, kCFURLPOSIXPathStyle, false);
+    
+    // open the audio file
+    //    CheckError(AudioFileOpenURL(myFileURL, fsRdPerm, 0, &player.playbackFile), "AudioFileOpenURL failed");
+    CheckError(AudioFileOpenURL(myFileURL, kAudioFileReadPermission, 0, &player.playbackFile), "AudioFileOpenURL failed");
+    CFRelease(myFileURL);
+    
+    // get the audio data format from the file
+    AudioStreamBasicDescription dataFormat;
+    UInt32 propSize = sizeof(dataFormat);
+    CheckError(AudioFileGetProperty(player.playbackFile, kAudioFilePropertyDataFormat,
+                                    &propSize, &dataFormat), "couldn't get file's data format");
+    
+    
+    // create a output (playback) queue
+    AudioQueueRef queue;
+    CheckError(AudioQueueNewOutput(&dataFormat, // ASBD
+                                   MyAQOutputCallback, // Callback
+                                   &player, // user data
+                                   NULL, // run loop
+                                   NULL, // run loop mode
+                                   0, // flags (always 0)
+                                   &queue), // output: reference to AudioQueue object
+               "AudioQueueNewOutput failed");
+    // create a input (recording) queue
+    AudioQueueRef queueOut = {0};
+    CheckError(AudioQueueNewInput(&dataFormat, // ASBD
+                                  MyAQInputCallback, // Callback
+                                  &player, // user data
+                                  NULL, // run loop
+                                  NULL, // run loop mode
+                                  0, // flags (always 0)
+                                  // &recorder.queue), // output: reference to AudioQueue object
+                                  &queue),
+               "AudioQueueNewInput failed");
+    
+    
+    // adjust buffer size to represent about a half second (0.5) of audio based on this format
+    UInt32 bufferByteSize;
+    CalculateBytesForTime(player.playbackFile, dataFormat,  0.5, &bufferByteSize, &player.numPacketsToRead);
+    
+    // check if we are dealing with a VBR file. ASBDs for VBR files always have
+    // mBytesPerPacket and mFramesPerPacket as 0 since they can fluctuate at any time.
+    // If we are dealing with a VBR file, we allocate memory to hold the packet descriptions
+    bool isFormatVBR = (dataFormat.mBytesPerPacket == 0 || dataFormat.mFramesPerPacket == 0);
+    if (isFormatVBR)
+        player.packetDescs = (AudioStreamPacketDescription*)malloc(sizeof(AudioStreamPacketDescription) * player.numPacketsToRead);
+    else
+        player.packetDescs = NULL; // we don't provide packet descriptions for constant bit rate formats (like linear PCM)
+    
+    // create the audio file
+    CFURLRef myFileURL2 = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, CFSTR("./output.wav"), kCFURLPOSIXPathStyle, false);
+    CFShow (myFileURL);
+    CheckError(AudioFileCreateWithURL(myFileURL, kAudioFileCAFType, &dataFormat,
+                                      kAudioFileFlags_EraseFile, &recorder.recordFile), "AudioFileCreateWithURL failed");
+    CFRelease(myFileURL);
+    
+    // get magic cookie from file and set on queue
+    MyCopyEncoderCookieToQueue(player.playbackFile, queue);
+    MyCopyEncoderCookieToFile(queue, recorder.recordFile);
+    
+    // allocate the buffers and prime the queue with some data before starting
+    AudioQueueBufferRef    buffers[kNumberPlaybackBuffers];
+    player.isDone = false;
+    player.packetPosition = 0;
+    int i;
+    for (i = 0; i < kNumberPlaybackBuffers; ++i)
+    {
+        CheckError(AudioQueueAllocateBuffer(queue, bufferByteSize, &buffers[i]), "AudioQueueAllocateBuffer failed");
+        
+        // manually invoke callback to fill buffers with data
+        MyAQOutputCallback(&player, queue, buffers[i]);
+        
+        // EOF (the entire file's contents fit in the buffers)
+        if (player.isDone)
+            break;
+    }
+    // allocate and enqueue buffers
+    int bufferByteSizeOut = MyComputeRecordBufferSize(&dataFormat, queueOut, 0.5);    // enough bytes for half a second
+    int bufferIndex;
+    for (bufferIndex = 0; bufferIndex < kNumberRecordBuffers; ++bufferIndex)
+    {
+        AudioQueueBufferRef buffer;
+        CheckError(AudioQueueAllocateBuffer(queue, bufferByteSizeOut, &buffer),
+                   "AudioQueueAllocateBuffer failed");
+        CheckError(AudioQueueEnqueueBuffer(queue, buffer, 0, NULL),
+                   "AudioQueueEnqueueBuffer failed");
+    }
+    
+    //CheckError(AudioQueueAddPropertyListener(aqp.queue, kAudioQueueProperty_IsRunning, MyAQPropertyListenerCallback, &aqp), "AudioQueueAddPropertyListener(kAudioQueueProperty_IsRunning) failed");
+    
+    // start the queue. this function returns immedatly and begins
+    // invoking the callback, as needed, asynchronously.
+    recorder.running = TRUE;
+    CheckError(AudioQueueStart(queue, NULL), "AudioQueueStart failed");
+    
+    // and wait
+    printf("Recording, press <return> to stop:\n");
+    getchar();
+    
+    // end recording
+    printf("* recording done *\n");
+    recorder.running = FALSE;
+    CheckError(AudioQueueStop(queue, TRUE), "AudioQueueStop failed");
+    
+    // a codec may update its magic cookie at the end of an encoding session
+    // so reapply it to the file now
+    MyCopyEncoderCookieToFile(queue, recorder.recordFile);
+    
+cleanup:
+    AudioQueueDispose(queue, TRUE);
+    AudioFileClose(player.playbackFile);
+    AudioFileClose(recorder.recordFile);
+    
+    return 0;
+}
